@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>X-Ray Earth - WebXR</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: sans-serif; }
+        #info {
+            position: absolute; top: 10px; width: 100%; text-align: center;
+            color: white; pointer-events: none; text-shadow: 1px 1px 2px black; z-index: 100;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">Look Through the Earth XR<br/>Getting GPS location...</div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        // 1. Scene, camera, renderer
+        const scene = new THREE.Scene();
+        // Near plane small: the stencil hole now defines what's visible, so the globe needs
+        // no rim trim, and the hole/well won't vanish when you lean in close.
+        const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.05, 10000);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.xr.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        // Hit-test is used to place the portal hole on a real surface.
+        document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['hit-test'] }));
+
+        // 2. Lighting (lights the inner surface we look at)
+        scene.add(new THREE.AmbientLight(0xffffff, 1.2));
+        const dir = new THREE.DirectionalLight(0xffffff, 2);
+        dir.position.set(1, 1, 1);
+        scene.add(dir);
+
+        // 3. Earth group.
+        //   - headingGroup: rotated ONCE at session start to align virtual north to true north.
+        //   - earth mesh: rotated by lat/lon so YOUR location sits at the top (the zenith,
+        //     i.e. the point of the inner surface directly under the camera). Looking straight
+        //     down then looks through the centre to the antipode on the far inner wall.
+        const earthRadius = 50;
+
+        const headingGroup = new THREE.Group();
+        // Top of the sphere sits exactly at the camera origin, so the camera is ON the inner
+        // surface at the zenith. The surface tangent is then at eye level, so the earth fills
+        // the entire lower hemisphere out to the horizon -- and this holds at ANY scale.
+        // (A nonzero eye-height offset would shrink the earth to a bowl well short of the
+        // horizon on a small sphere, because that offset is an absolute distance, not scaled.)
+        headingGroup.position.set(0, -earthRadius, 0);
+        scene.add(headingGroup);
+
+        const geometry = new THREE.SphereGeometry(earthRadius, 64, 64);
+
+        const material = new THREE.MeshStandardMaterial({
+            color: 0x1b3a6b,          // visible fallback if the texture fails/late
+            roughness: 0.6,
+            side: THREE.BackSide,     // draw inner surface only -> see through to the far wall
+            // PORTAL: the earth is only drawn where the stencil buffer == 1, i.e. inside the
+            // hole disc. Everywhere else it is not drawn, so AR passthrough (real ground) shows.
+            stencilWrite: true,
+            stencilRef: 1,
+            stencilFunc: THREE.EqualStencilFunc,
+            stencilFail: THREE.KeepStencilOp,
+            stencilZFail: THREE.KeepStencilOp,
+            stencilZPass: THREE.KeepStencilOp
+        });
+
+        const textureLoader = new THREE.TextureLoader();
+        textureLoader.setCrossOrigin('anonymous');
+        textureLoader.load(
+            'https://unpkg.com/three-globe/example/img/earth-blue-marble.jpg',
+            (tex) => {
+                tex.colorSpace = THREE.SRGBColorSpace;
+                material.map = tex;
+                material.color.set(0xffffff); // let the texture show at full brightness
+                material.needsUpdate = true;
+            },
+            undefined,
+            (err) => {
+                console.error('Earth texture failed to load:', err);
+                document.getElementById('info').innerHTML =
+                    'Texture failed to load (CORS?). Showing plain blue earth.';
+            }
+        );
+
+        const earth = new THREE.Mesh(geometry, material);
+        earth.renderOrder = 3; // draw after stencil disc (0) and well wall (1)
+        headingGroup.add(earth);
+
+        // ---- Procedural textures (canvas-based, so no extra CORS dependency) ----
+        // Rough earthy/concrete wall for the well interior.
+        function makeWallTexture() {
+            const c = document.createElement('canvas');
+            c.width = c.height = 256;
+            const g = c.getContext('2d');
+            g.fillStyle = '#3a3027';
+            g.fillRect(0, 0, 256, 256);
+            for (let i = 0; i < 4000; i++) {
+                const v = Math.random();
+                g.fillStyle = `rgba(${30 + v * 90 | 0},${24 + v * 70 | 0},${18 + v * 50 | 0},0.5)`;
+                const x = Math.random() * 256, y = Math.random() * 256, r = Math.random() * 3 + 0.5;
+                g.fillRect(x, y, r, r);
+            }
+            const t = new THREE.CanvasTexture(c);
+            t.wrapS = t.wrapT = THREE.RepeatWrapping;
+            t.repeat.set(4, 1);
+            return t;
+        }
+
+        // Cracked ring that sits on the floor around the lip. Transparent centre + outer
+        // fade, radial cracks -> reads as a broken edge rather than a painted disc.
+        function makeCrackTexture() {
+            const S = 512, c = document.createElement('canvas');
+            c.width = c.height = S;
+            const g = c.getContext('2d');
+            g.clearRect(0, 0, S, S);
+            const cx = S / 2, cy = S / 2;
+            // soft grey debris ring, fading in and out radially
+            const grad = g.createRadialGradient(cx, cy, S * 0.30, cx, cy, S * 0.5);
+            grad.addColorStop(0, 'rgba(120,120,120,0)');
+            grad.addColorStop(0.25, 'rgba(90,90,90,0.55)');
+            grad.addColorStop(1, 'rgba(90,90,90,0)');
+            g.fillStyle = grad;
+            g.fillRect(0, 0, S, S);
+            // radial cracks
+            g.strokeStyle = 'rgba(20,20,20,0.8)';
+            g.lineWidth = 2;
+            for (let i = 0; i < 22; i++) {
+                const a = (i / 22) * Math.PI * 2 + (Math.random() - 0.5) * 0.3;
+                let r = S * 0.30, x = cx + Math.cos(a) * r, y = cy + Math.sin(a) * r;
+                g.beginPath(); g.moveTo(x, y);
+                let aa = a;
+                while (r < S * 0.5) {
+                    r += 8 + Math.random() * 14;
+                    aa += (Math.random() - 0.5) * 0.5;
+                    x = cx + Math.cos(aa) * r; y = cy + Math.sin(aa) * r;
+                    g.lineTo(x, y);
+                }
+                g.stroke();
+            }
+            return new THREE.CanvasTexture(c);
+        }
+
+        // PORTAL GROUP: disc (stencil mask) + well wall + cracked rim, placed together.
+        const portal = new THREE.Group();
+        portal.visible = false;
+        scene.add(portal);
+
+        const holeRadius = 0.6;     // metres; the opening on the floor
+        const crustThickness = 0.2; // metres; how thick the "crust" edge looks
+
+        // 1) Stencil disc: marks the hole footprint. No colour, no depth.
+        const maskMat = new THREE.MeshBasicMaterial({
+            colorWrite: false,
+            depthWrite: false,
+            stencilWrite: true,
+            stencilRef: 1,
+            stencilFunc: THREE.AlwaysStencilFunc,
+            stencilZPass: THREE.ReplaceStencilOp,
+            stencilFail: THREE.ReplaceStencilOp,
+            stencilZFail: THREE.ReplaceStencilOp
+        });
+        const portalMask = new THREE.Mesh(new THREE.CircleGeometry(holeRadius, 64), maskMat);
+        portalMask.rotation.x = -Math.PI / 2;
+        portalMask.renderOrder = 0;
+        portal.add(portalMask);
+
+        // 2) Well wall: open cylinder, BackSide (we see the inner wall), top flush with the
+        //    floor and descending by crustThickness. Stencilled so it only shows in the hole.
+        const wellMat = new THREE.MeshStandardMaterial({
+            map: makeWallTexture(),
+            roughness: 0.95,
+            side: THREE.BackSide,
+            stencilWrite: true,
+            stencilRef: 1,
+            stencilFunc: THREE.EqualStencilFunc,
+            stencilFail: THREE.KeepStencilOp,
+            stencilZFail: THREE.KeepStencilOp,
+            stencilZPass: THREE.KeepStencilOp
+        });
+        const wellGeo = new THREE.CylinderGeometry(
+            holeRadius, holeRadius, crustThickness, 64, 1, true /* openEnded */
+        );
+        const well = new THREE.Mesh(wellGeo, wellMat);
+        well.position.y = -crustThickness / 2; // top edge at floor (y=0), descends below
+        well.renderOrder = 1;
+        portal.add(well);
+
+        // 3) Cracked rim: flat ring on the floor around the lip (lives OUTSIDE the stencil).
+        const rimMat = new THREE.MeshBasicMaterial({
+            map: makeCrackTexture(),
+            transparent: true,
+            depthWrite: false
+        });
+        const rim = new THREE.Mesh(new THREE.PlaneGeometry(holeRadius * 4, holeRadius * 4), rimMat);
+        rim.rotation.x = -Math.PI / 2;
+        rim.position.y = 0.002; // just above floor to avoid z-fight with passthrough
+        rim.renderOrder = 2;
+        portal.add(rim);
+
+        // Reticle: shows where the hole will be placed before you tap.
+        const reticle = new THREE.Mesh(
+            new THREE.RingGeometry(holeRadius * 0.95, holeRadius, 48).rotateX(-Math.PI / 2),
+            new THREE.MeshBasicMaterial({ color: 0x66ccff })
+        );
+        reticle.matrixAutoUpdate = false;
+        reticle.visible = false;
+        scene.add(reticle);
+
+        let portalPlaced = false;
+
+        // 4. Place the user's lat/lon at the TOP of the sphere (the zenith point).
+        //
+        // Three.js SphereGeometry equirectangular mapping:
+        //   - The texture's vertical centre (the equator) wraps the sphere's equator.
+        //   - With the blue-marble image, lon = 0 (prime meridian) maps to roughly -Z
+        //     before any rotation; longitude increases eastward.
+        //
+        // To bring (lat, lon) to the +Y pole:
+        //   1. Spin about Y so the target longitude faces a known direction.
+        //   2. Tilt about X so that meridian point rises from the equator to the top pole.
+        //
+        // These offsets are calibrated for the blue-marble texture above; if you swap the
+        // image you may need to nudge the longitude offset.
+        // Derived from Three.js SphereGeometry vertex equations (phiStart=0, thetaStart=0):
+        //   py =  r*cos(v*PI)            -> v=0 is +Y (north pole), texture top edge
+        //   px = -r*cos(u*2PI)*sin(...)  -> u=0.5 (prime meridian, lon 0) lands on +X
+        //   pz =  r*sin(u*2PI)*sin(...)  -> longitude increases toward +Z
+        // So latitude maps to py = r*sin(lat), and the prime meridian sits on the +X axis
+        // with east (increasing lon) swinging toward -Z (so west is toward +Z).
+        //
+        // To bring (lat, lon) to the top pole (+Y):
+        //   1) rotate about Y by -lon  -> brings the target meridian back onto +X
+        //   2) rotate about Z by (PI/2 - lat) -> lifts that point from the +X side up to +Y
+        // Order 'ZYX' applies X, then Y, then Z, so the Y (longitude) spin happens before
+        // the Z (latitude) tilt, which is what we need.
+        function alignToLocation(latDeg, lonDeg) {
+            const lat = latDeg * Math.PI / 180;
+            const lon = lonDeg * Math.PI / 180;
+
+            earth.rotation.order = 'ZYX';
+            earth.rotation.set(0, 0, 0);
+            earth.rotation.y = -lon;
+            earth.rotation.z = (Math.PI / 2 - lat);
+        }
+
+        // 5. Geolocation
+        let located = false;
+        if ('geolocation' in navigator) {
+            navigator.geolocation.getCurrentPosition((position) => {
+                const lat = position.coords.latitude;
+                const lon = position.coords.longitude;
+                curLat = lat;
+                curLon = lon;
+                alignToLocation(lat, lon);
+                located = true;
+                updateInfo();
+            }, () => {
+                alignToLocation(0, 0);
+                document.getElementById('info').innerHTML = "GPS Error. Using (0,0).<br/>Tap 'Start AR'";
+            });
+        } else {
+            alignToLocation(0, 0);
+            document.getElementById('info').innerHTML = "Geolocation not supported. Using (0,0).<br/>Tap 'Start AR'";
+        }
+
+        // 6. Compass: capture heading ONCE to set the north offset, then stop.
+        //    WebXR device tracking handles all subsequent rotation as you turn, so we must
+        //    NOT keep writing rotation every event (that double-counts and counter-rotates).
+        let headingApplied = false;
+        let latestHeading = null;
+        let curLat = null;
+        let curLon = null;
+
+        // Human-readable 8-point compass, e.g. 135 -> "south-east".
+        function degToCompass(deg) {
+            const dirs = ['north', 'north-east', 'east', 'south-east',
+                          'south', 'south-west', 'west', 'north-west'];
+            const idx = Math.round((((deg % 360) + 360) % 360) / 45) % 8;
+            return dirs[idx];
+        }
+
+        // Refresh the pre-AR overlay text with location + live heading.
+        function updateInfo() {
+            if (renderer.xr.isPresenting) return; // don't overwrite during AR
+            let s = 'Look Through the Earth XR<br/>';
+            if (curLat !== null) {
+                s += `Lat: ${curLat.toFixed(2)}, Lon: ${curLon.toFixed(2)}<br/>`;
+            } else {
+                s += 'Getting GPS location...<br/>';
+            }
+            if (latestHeading !== null) {
+                s += `Facing: ${degToCompass(latestHeading)} (${Math.round(latestHeading)}\u00B0)<br/>`;
+            }
+            s += 'Tap "Start AR"';
+            document.getElementById('info').innerHTML = s;
+        }
+
+        function headingFromEvent(event) {
+            // webkitCompassHeading (iOS) is degrees clockwise from north.
+            // alpha from deviceorientationabsolute is degrees counter-clockwise from north.
+            if (typeof event.webkitCompassHeading === 'number') {
+                return event.webkitCompassHeading; // CW from north
+            }
+            if (event.alpha !== null && event.absolute) {
+                return 360 - event.alpha; // convert CCW -> CW from north
+            }
+            return null;
+        }
+
+        function onOrientation(event) {
+            const h = headingFromEvent(event);
+            if (h !== null) {
+                latestHeading = h;
+                updateInfo();
+            }
+        }
+
+        // iOS needs a permission gesture; Android fires deviceorientationabsolute directly.
+        function startOrientation() {
+            if (typeof DeviceOrientationEvent !== 'undefined' &&
+                typeof DeviceOrientationEvent.requestPermission === 'function') {
+                DeviceOrientationEvent.requestPermission().then((state) => {
+                    if (state === 'granted') {
+                        window.addEventListener('deviceorientation', onOrientation, true);
+                    }
+                }).catch(() => {});
+            } else {
+                window.addEventListener('deviceorientationabsolute', onOrientation, true);
+                window.addEventListener('deviceorientation', onOrientation, true);
+            }
+        }
+        startOrientation();
+
+        // Apply the heading once, on the first XR frame we have a reading for.
+        renderer.xr.addEventListener('sessionstart', () => { headingApplied = false; });
+
+        // Hit-test: acquire a viewer-space hit-test source once the session starts.
+        let hitTestSource = null;
+        let hitTestRequested = false;
+
+        async function ensureHitTestSource() {
+            const session = renderer.xr.getSession();
+            if (!session || hitTestRequested) return;
+            hitTestRequested = true;
+            try {
+                const viewerSpace = await session.requestReferenceSpace('viewer');
+                hitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+            } catch (e) {
+                console.warn('Hit-test unavailable:', e);
+            }
+            session.addEventListener('end', () => {
+                hitTestSource = null;
+                hitTestRequested = false;
+                portalPlaced = false;
+                portal.visible = false;
+                reticle.visible = false;
+            });
+        }
+
+        // Tap to lock the hole at the current reticle position.
+        function onSelect() {
+            if (reticle.visible) {
+                const p = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+                // Place the whole portal group (disc + well + rim) at the hit point.
+                portal.position.copy(p);
+                // Anchor the globe so its top (zenith) sits just below the well bottom, so the
+                // crust reads as solid thickness with the void/globe starting beneath it.
+                // (Sinking by crustThickness is the value most likely to want nudging on-device.)
+                headingGroup.position.set(
+                    p.x,
+                    p.y - earthRadius - crustThickness,
+                    p.z
+                );
+                portal.visible = true;
+                portalPlaced = true;
+                reticle.visible = false;
+            }
+        }
+
+        // 7. Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // 8. Render loop
+        let selectRegistered = false;
+        renderer.setAnimationLoop((timestamp, frame) => {
+            if (renderer.xr.isPresenting) {
+                ensureHitTestSource();
+                const session = renderer.xr.getSession();
+                if (session && !selectRegistered) {
+                    session.addEventListener('select', onSelect);
+                    selectRegistered = true;
+                }
+
+                // Update the reticle from the latest hit-test result until the hole is placed.
+                if (frame && hitTestSource && !portalPlaced) {
+                    const refSpace = renderer.xr.getReferenceSpace();
+                    const results = frame.getHitTestResults(hitTestSource);
+                    if (results.length > 0) {
+                        const pose = results[0].getPose(refSpace);
+                        reticle.visible = true;
+                        reticle.matrix.fromArray(pose.transform.matrix);
+                    } else {
+                        reticle.visible = false;
+                    }
+                }
+            }
+
+            if (!headingApplied && renderer.xr.isPresenting && latestHeading !== null) {
+                // Account for screen orientation (portrait vs landscape) offset.
+                const screenAngle = (screen.orientation && screen.orientation.angle) || 0;
+                // Frame relationship (validated against on-device behaviour):
+                //   - At session start the camera looks along world -Z, which corresponds
+                //     to real compass bearing H (= latestHeading).
+                //   - After alignToLocation the model's geographic NORTH points along
+                //     world -X, i.e. world bearing H-90 -- NOT toward your facing.
+                //   - Three.js Ry(psi) shifts a direction's world azimuth by -psi.
+                // Solving bearing_apparent = H + azimuth0 - psi to put a true-SW target
+                // back at SW gives psi = H - 90. (+H lands it 90deg off toward SE; -H
+                // lands it ~east -- both observed, confirming this offset.)
+                const headingRad = (latestHeading + screenAngle - 90) * Math.PI / 180;
+                headingGroup.rotation.y = headingRad;
+                headingApplied = true;
+            }
+            renderer.render(scene, camera);
+        });
+    </script>
+</body>
+</html>
